@@ -21,6 +21,26 @@ page (e.g. 1033 / 5xx). That page:
 the origin is detected as down, and removes it again the moment the origin
 recovers — without keeping a Worker permanently on the route.
 
+## Designed for the Cloudflare Free plan
+
+Cloudflare's native way to replace error pages —
+[custom error pages](https://developers.cloudflare.com/rules/custom-errors/)
+— requires a **Pro plan or above**. On the Free plan you're stuck with
+Cloudflare's default 1033 / 5xx pages that leak the fact you're using
+Cloudflare Tunnel.
+
+`tunnel-cloak` is the Free-plan workaround. It uses only resources available
+on the Free plan:
+
+- Workers (with cron triggers) — Free plan includes 100k requests/day.
+- Workers KV — Free plan includes 100k reads / 1k writes per day.
+- Workers Routes — included.
+
+So if you're on a Free account and want to hide Cloudflare Tunnel's default
+error pages behind your own branded maintenance page, this is for you. If
+you're already on a Pro plan or above, you can just use Cloudflare's
+built-in custom error pages instead.
+
 ## How it works
 
 ```
