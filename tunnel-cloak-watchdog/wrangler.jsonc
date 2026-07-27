@@ -1,0 +1,52 @@
+{
+  // Cloudflare Workers config — see https://developers.cloudflare.com/workers/wrangler/configuration/
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tunnel-cloak-watchdog",
+  "main": "worker.js",
+  // Set to today's date when you create the project; bump periodically.
+  "compatibility_date": "2026-07-27",
+  // Enable nodejs_compat — harmless to set and keeps future deps happy.
+  "compatibility_flags": ["nodejs_compat"],
+  // Cron schedule. Edit to taste. The expression below runs every minute.
+  // Free plan: max 5 cron triggers per account. Paid: 250.
+  // Docs: https://developers.cloudflare.com/workers/configuration/cron-triggers/
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+  // KV namespace holds our run-to-run state (current status, consecutive
+  // failures, the route id we own). Create with:
+  //   npx wrangler kv namespace create STATUS_KV
+  // then paste the returned id below.
+  "kv_namespaces": [
+    {
+      "binding": "STATUS_KV",
+      "id": "e8f8b6b3c0414340b7781fc07d577485"
+    }
+  ],
+  // Non-secret, non-personal config lives here as plain vars.
+  //
+  // Personal values (your domain, zone id, route pattern) are intentionally
+  // ABSENT from this file so the repo can be public. Set them as encrypted
+  // secrets instead:
+  //
+  //   npx wrangler secret put MONITOR_URL
+  //   npx wrangler secret put TARGET_ZONE_ID
+  //   npx wrangler secret put TARGET_PATTERN
+  //
+  // For local dev, put the same keys in `.dev.vars` (gitignored).
+  // At runtime both vars and secrets are accessed identically via `env.X`.
+  "vars": {
+    // Name (not binding) of the Worker script to wire up on the route.
+    // Not personal — just a script name. Safe to commit.
+    "TARGET_SCRIPT": "tunnel-cloak-fallback",
+    // Probe timeout in ms.
+    "PROBE_TIMEOUT_MS": "8000",
+    // Consecutive probe failures before flipping to DOWN (anti-flap).
+    "FAILURE_THRESHOLD": "2"
+  },
+  "observability": {
+    "enabled": true,
+    // Cron handlers are infrequent — keep 100% sampling for easy debugging.
+    "logs": { "head_sampling_rate": 1 }
+  }
+}

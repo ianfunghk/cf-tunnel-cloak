@@ -1,0 +1,13 @@
+{
+  // Cloudflare Workers config — see https://developers.cloudflare.com/workers/wrangler/configuration/
+  "name": "tunnel-cloak-fallback",
+  "main": "worker.js",
+  "compatibility_date": "2026-07-27",
+  // Under the tunnel-cloak design, the watchdog manages this Worker's route
+  // dynamically. Leave `routes` unset here — a static route would fail deploy
+  // with "Could not find zone" until the operator fills in their real domain.
+  "observability": {
+    "enabled": true,
+    "logs": { "head_sampling_rate": 1 }
+  }
+}

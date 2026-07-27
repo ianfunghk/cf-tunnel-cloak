@@ -1,0 +1,22 @@
+# Local development secrets — copy to `.dev.vars` and fill in.
+# NEVER commit the real `.dev.vars` file (it's gitignored).
+#
+# These values are intentionally NOT in wrangler.jsonc so the repo can be
+# public. In production, set the same keys with `wrangler secret put`.
+
+# ── Cloudflare API token (real secret) ─────────────────────────────────────
+# Requires "Workers Routes: Write" on the target zone.
+# Create at: https://dash.cloudflare.com/profile/api-tokens
+CF_API_TOKEN=replace-with-your-api-token
+
+# ── Personal config (not a "secret" but should stay out of git) ────────────
+# Full URL to probe. Include scheme + path.
+MONITOR_URL=https://app.example.com/health
+
+# Zone ID of the zone that owns TARGET_PATTERN.
+# Find in dashboard: zone Overview → right sidebar → Zone ID.
+TARGET_ZONE_ID=replace-with-your-zone-id
+
+# Route pattern that activates the fallback Worker.
+# Must live inside the zone named by TARGET_ZONE_ID.
+TARGET_PATTERN=fallback.example.com/*
