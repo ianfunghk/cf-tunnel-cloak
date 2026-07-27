@@ -25,13 +25,14 @@
   ],
   // Non-secret, non-personal config lives here as plain vars.
   //
-  // Personal values (your domain, zone id, route pattern) are intentionally
-  // ABSENT from this file so the repo can be public. Set them as encrypted
-  // secrets instead:
+  // Personal values (your domain, zone id, route pattern, API token) are
+  // intentionally ABSENT from this file so the repo can be public. Set them
+  // as encrypted secrets instead:
   //
-  //   npx wrangler secret put MONITOR_URL
-  //   npx wrangler secret put TARGET_ZONE_ID
-  //   npx wrangler secret put TARGET_PATTERN
+  //   npx wrangler secret put CF_API_TOKEN     # token w/ Workers Routes:Edit on the zone
+  //   npx wrangler secret put MONITOR_URL      # https://hostname-you-protect/health
+  //   npx wrangler secret put TARGET_ZONE_ID   # 32-hex zone id from dashboard
+  //   npx wrangler secret put TARGET_PATTERN   # e.g. app.mydomain.com/*
   //
   // For local dev, put the same keys in `.dev.vars` (gitignored).
   // At runtime both vars and secrets are accessed identically via `env.X`.

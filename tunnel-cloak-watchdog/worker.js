@@ -25,6 +25,30 @@ const DEFAULT_FAILURE_THRESHOLD = 2;
 const PROBE_USER_AGENT = 'tunnel-cloak-watchdog/1.0 (+cron)';
 
 // ---------------------------------------------------------------------------
+// Config validation — fail fast on missing/malformed secrets so we never
+// send a request to /zones/<undefined>/workers/routes and produce confusing
+// API errors. Returns { ok: true } or { ok: false, error }.
+// ---------------------------------------------------------------------------
+function validateConfig(env) {
+  const required = ['MONITOR_URL', 'TARGET_ZONE_ID', 'TARGET_PATTERN', 'CF_API_TOKEN'];
+  const missing = required.filter((k) => !env[k] || typeof env[k] !== 'string' || env[k].trim() === '');
+  if (missing.length) {
+    return { ok: false, error: `missing required secrets: ${missing.join(', ')}` };
+  }
+  if (!/^https?:\/\//i.test(env.MONITOR_URL)) {
+    return { ok: false, error: `MONITOR_URL must be an http(s) URL, got: ${env.MONITOR_URL}` };
+  }
+  // Cloudflare zone ids are 32 lowercase hex chars.
+  if (!/^[0-9a-f]{32}$/i.test(env.TARGET_ZONE_ID)) {
+    return { ok: false, error: `TARGET_ZONE_ID should be a 32-hex-char zone id, got: ${env.TARGET_ZONE_ID}` };
+  }
+  if (!env.STATUS_KV || typeof env.STATUS_KV.get !== 'function') {
+    return { ok: false, error: 'STATUS_KV binding is missing — check kv_namespaces in wrangler.jsonc' };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -224,6 +248,17 @@ export default {
    * @param {ExecutionContext} _ctx
    */
   async scheduled(_controller, env, _ctx) {
+    // Fail fast on missing/malformed config so we never send a request to
+    // /zones/<undefined>/workers/routes and produce a confusing 7003 error.
+    const cfg = validateConfig(env);
+    if (!cfg.ok) {
+      console.error(JSON.stringify({
+        message: 'config invalid, aborting tick',
+        error: cfg.error,
+      }));
+      return;
+    }
+
     const timeoutMs = Number(env.PROBE_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
     const threshold = Number(env.FAILURE_THRESHOLD) || DEFAULT_FAILURE_THRESHOLD;
 
