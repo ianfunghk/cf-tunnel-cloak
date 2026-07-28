@@ -104,7 +104,8 @@ npx wrangler deploy
 # 2. Deploy the watchdog Worker.
 cd ../tunnel-cloak-watchdog
 # Follow the deployment steps in its README (KV namespace, secrets, etc.)
-npx wrangler deploy
+# Deploy from the local override so the real KV namespace id is used.
+npx wrangler deploy -c wrangler.local.jsonc
 ```
 
 Each subproject has its own `README.md` with full setup instructions:
