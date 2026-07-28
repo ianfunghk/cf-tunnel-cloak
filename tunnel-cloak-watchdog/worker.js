@@ -9,10 +9,16 @@
  * state transitions (down → up, up → down), not on every cron tick.
  *
  * KV write minimization: we only write back when a *material* field
- * (status, consecutiveFailures, routeId) actually changes. A steady-state
- * tick (origin still up, still healthy) does not touch KV at all, which
- * keeps us well within the Free plan's 1,000 writes/day quota even with a
- * 1-minute cron (1,440 ticks/day).
+ * (status, consecutiveFailures, consecutiveSuccesses, routeId) actually
+ * changes. A steady-state tick (origin still up, still healthy) does not
+ * touch KV at all, which keeps us well within the Free plan's 1,000
+ * writes/day quota even with a 1-minute cron (1,440 ticks/day).
+ *
+ * Caveat: while DOWN and accumulating recovery successes with
+ * RECOVERY_THRESHOLD > 1, each below-threshold success writes once (at
+ * most threshold-1 extra writes per recovery event). Recovery events are
+ * rare relative to steady-state ticks, so the daily quota is not at risk,
+ * but the "DOWN ticks never write" intuition no longer holds absolutely.
  *
  * All runtime configuration comes from environment variables / secrets
  * (see wrangler.jsonc bindings and `.dev.vars.example`). No secrets in
@@ -27,6 +33,14 @@
 const DEFAULT_TIMEOUT_MS = 8000;
 /** Consecutive failures required before flipping to DOWN (anti-flap). */
 const DEFAULT_FAILURE_THRESHOLD = 2;
+/**
+ * Consecutive successful probes required while DOWN before flipping back to
+ * UP (anti-flap on recovery). Default 1 preserves the original behaviour
+ * (a single successful probe instantly recovers). Set higher (e.g. 3) to
+ * keep the fallback served while the origin / Docker containers finish
+ * booting after the host comes back online.
+ */
+const DEFAULT_RECOVERY_THRESHOLD = 1;
 /** Minimum probe timeout — anything below this is almost certainly a misconfig. */
 const MIN_TIMEOUT_MS = 500;
 /** Default User-Agent for the probe. Override via env.PROBE_USER_AGENT
@@ -36,7 +50,8 @@ const DEFAULT_PROBE_USER_AGENT = 'tunnel-cloak-watchdog/1.0 (+cron)';
 /**
  * Parse a positive-integer env var. Empty / unset / NaN → fallback. `0` is
  * NOT ignored (unlike `Number(x) || default`), but values < 1 fall back too,
- * so setting FAILURE_THRESHOLD=0 still does the safe thing.
+ * so setting FAILURE_THRESHOLD=0 (or RECOVERY_THRESHOLD=0) still does the
+ * safe thing.
  *
  * @param {string|undefined} raw
  * @param {number} fallback
@@ -143,13 +158,14 @@ async function readState(kv) {
     return {
       status: raw.status === 'down' ? 'down' : 'up',
       consecutiveFailures: Number(raw.consecutiveFailures) || 0,
+      consecutiveSuccesses: Number(raw.consecutiveSuccesses) || 0,
       routeId: typeof raw.routeId === 'string' ? raw.routeId : null,
       updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : null,
     };
   }
   // Fresh start: assume UP so we don't spuriously enable the fallback on
   // the very first run before we've actually probed.
-  return { status: 'up', consecutiveFailures: 0, routeId: null, updatedAt: null };
+  return { status: 'up', consecutiveFailures: 0, consecutiveSuccesses: 0, routeId: null, updatedAt: null };
 }
 
 /** Write the state back to KV. */
@@ -167,6 +183,7 @@ function hasStateChanged(prev, next) {
   return (
     prev.status !== next.status ||
     prev.consecutiveFailures !== next.consecutiveFailures ||
+    prev.consecutiveSuccesses !== next.consecutiveSuccesses ||
     prev.routeId !== next.routeId
   );
 }
@@ -378,6 +395,7 @@ async function runTick(env) {
 
   const timeoutMs = timeoutMsEnv(env.PROBE_TIMEOUT_MS);
   const threshold = positiveIntEnv(env.FAILURE_THRESHOLD, DEFAULT_FAILURE_THRESHOLD);
+  const recoveryThreshold = positiveIntEnv(env.RECOVERY_THRESHOLD, DEFAULT_RECOVERY_THRESHOLD);
   const userAgent = env.PROBE_USER_AGENT && env.PROBE_USER_AGENT.trim()
     ? env.PROBE_USER_AGENT
     : DEFAULT_PROBE_USER_AGENT;
@@ -390,17 +408,40 @@ async function runTick(env) {
 
   if (up) {
     if (state.status === 'down') {
-      // Recovered — remove the route to disable the fallback Worker.
-      nextState = {
-        ...(await disableFallback(env, state)),
-        consecutiveFailures: 0,
-        updatedAt: now,
-      };
+      // Accumulate consecutive successes while DOWN. Only flip back to UP
+      // (and remove the fallback route) once we've seen
+      // `recoveryThreshold` good probes in a row. This keeps the fallback
+      // page served while the origin / Docker containers finish booting
+      // after the host comes back online. With the default threshold of 1
+      // this is equivalent to the original "recover on first success".
+      const successes = state.consecutiveSuccesses + 1;
+      if (successes >= recoveryThreshold) {
+        nextState = {
+          ...(await disableFallback(env, state)),
+          consecutiveFailures: 0,
+          consecutiveSuccesses: 0,
+          updatedAt: now,
+        };
+      } else {
+        // Not yet confident — keep serving the fallback. Record the
+        // accumulating success so future ticks can eventually trip the
+        // threshold.
+        nextState = { ...state, consecutiveSuccesses: successes, updatedAt: now };
+        console.log(JSON.stringify({
+          message: 'probe up but below recovery threshold',
+          consecutive_successes: successes,
+          recovery_threshold: recoveryThreshold,
+          current_status: state.status,
+        }));
+      }
     } else if (state.consecutiveFailures !== 0) {
-      // Was tentatively failing but is back up before crossing threshold.
-      // Reset the counter (status & routeId unchanged). If the counter was
-      // already 0, there is nothing material to write — leave nextState ===
-      // state so we skip the KV write entirely.
+      // Was tentatively failing but is back up before crossing the DOWN
+      // threshold. Reset the failure counter (status & routeId
+      // unchanged). `consecutiveSuccesses` is an invariant 0 while UP
+      // (only ever incremented in the DOWN + probe-up branch), so there is
+      // nothing to reset there. If `consecutiveFailures` was already 0,
+      // there is nothing material to write — leave nextState === state so
+      // we skip the KV write entirely.
       nextState = { ...state, consecutiveFailures: 0, updatedAt: now };
     }
     // else: still up, counter already 0 → no material change, skip write.
@@ -411,6 +452,8 @@ async function runTick(env) {
       nextState = {
         ...(await enableFallback(env, state)),
         consecutiveFailures: failures,
+        // Any half-accumulated recovery progress is voided by a failure.
+        consecutiveSuccesses: 0,
         updatedAt: now,
       };
     } else if (state.status === 'up') {
@@ -423,12 +466,20 @@ async function runTick(env) {
         threshold,
         current_status: state.status,
       }));
+    } else {
+      // Already DOWN and a probe just failed again. Reset any partial
+      // recovery progress: a single failure during the recovery window
+      // should force the origin to start the count over from scratch.
+      // Only write if we actually had progress to clear (avoid the
+      // no-op KV write on every tick while DOWN).
+      if (state.consecutiveSuccesses !== 0) {
+        nextState = { ...state, consecutiveSuccesses: 0, updatedAt: now };
+      }
+      // else: already DOWN, no recovery progress → no material change,
+      // skip write. (consecutiveFailures is intentionally NOT bumped
+      // while DOWN — no logic reads it once status === 'down', so a
+      // write would be pure waste.)
     }
-    // else: already DOWN and the route is already wired in. The
-    // consecutiveFailures counter has no further effect while DOWN (no
-    // logic reads it once status === 'down'), so we deliberately do NOT
-    // bump it — that would be a KV write on every tick for nothing.
-    // nextState stays === state.
   }
 
   if (hasStateChanged(state, nextState)) {
@@ -439,6 +490,7 @@ async function runTick(env) {
     probe_up: up,
     status: nextState.status,
     consecutive_failures: nextState.consecutiveFailures,
+    consecutive_successes: nextState.consecutiveSuccesses,
     route_id: nextState.routeId,
     updated_at: nextState.updatedAt,
     kv_written: hasStateChanged(state, nextState),

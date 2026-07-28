@@ -106,6 +106,7 @@ Only the non-personal tunables live in the committed config. Open
 | `TARGET_SCRIPT` | Name of the fallback Worker script. | `tunnel-cloak-fallback` |
 | `PROBE_TIMEOUT_MS` | Probe timeout in ms. | `8000` |
 | `FAILURE_THRESHOLD` | Consecutive failures before flipping to DOWN. | `2` |
+| `RECOVERY_THRESHOLD` | Consecutive successful probes while DOWN before flipping back to UP. Raise it to keep the fallback served while the origin / Docker containers finish booting after the host comes back online. | `1` |
 | `PROBE_USER_AGENT` | User-Agent header sent on probe. Override if your origin blocks unknown UAs. | `tunnel-cloak-watchdog/1.0 (+cron)` |
 
 > **Why not put personal values here?** Anything in `wrangler.jsonc` → `vars`
@@ -229,7 +230,8 @@ npx wrangler tail
 ```
 
 Each tick emits one JSON log line with `message: "tick complete"` plus the
-current `status`, `consecutive_failures`, `route_id`, and `updated_at`.
+current `status`, `consecutive_failures`, `consecutive_successes`,
+`route_id`, and `updated_at`.
 
 ## Logs
 
@@ -245,6 +247,7 @@ All logs are emitted as structured JSON (one object per line). Look for
 - `tick complete` — every cron tick, includes resulting state
 - `route added — fallback worker enabled` — transition UP → DOWN
 - `route removed — fallback worker disabled` — transition DOWN → UP
+- `probe up but below recovery threshold` — origin answered but the fallback is intentionally kept served until enough consecutive successes accumulate
 - `probe failed` — a single probe failed (not yet over threshold)
 
 ## Tuning guide
@@ -253,6 +256,7 @@ All logs are emitted as structured JSON (one object per line). Look for
 |---|---|
 | Want fewer false alarms during brief blips | Raise `FAILURE_THRESHOLD` |
 | Want to react faster to outages | Lower cron interval (e.g. `*/30 * * * * *` is not valid — use the minimum `* * * * *`), lower `FAILURE_THRESHOLD` |
+| Fallback is removed too early — visitors see Cloudflare error page while Docker containers finish booting | Raise `RECOVERY_THRESHOLD` (e.g. `3`) so the origin must answer several probes in a row before the fallback is disabled |
 | Probe a slow endpoint | Raise `PROBE_TIMEOUT_MS` |
 | Probe returns 4xx but origin is alive | No change needed — 4xx is treated as UP by design |
 

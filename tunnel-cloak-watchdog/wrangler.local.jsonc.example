@@ -32,7 +32,8 @@
   "vars": {
     "TARGET_SCRIPT": "tunnel-cloak-fallback",
     "PROBE_TIMEOUT_MS": "8000",
-    "FAILURE_THRESHOLD": "2"
+    "FAILURE_THRESHOLD": "2",
+    "RECOVERY_THRESHOLD": "1"
   },
   "observability": { "enabled": true, "logs": { "head_sampling_rate": 1 } }
 }

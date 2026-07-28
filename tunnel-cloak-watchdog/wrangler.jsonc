@@ -46,7 +46,13 @@
     // Probe timeout in ms.
     "PROBE_TIMEOUT_MS": "8000",
     // Consecutive probe failures before flipping to DOWN (anti-flap).
-    "FAILURE_THRESHOLD": "2"
+    "FAILURE_THRESHOLD": "2",
+    // Consecutive successful probes while DOWN before flipping back to UP
+    // (anti-flap on recovery). Default 1 = recover on first success (same
+    // as the original behaviour). Raise it (e.g. 3) to keep the fallback
+    // served while the origin / Docker containers finish booting after the
+    // host comes back online.
+    "RECOVERY_THRESHOLD": "1"
     // Override the probe User-Agent by setting PROBE_USER_AGENT here or as a
     // secret. Defaults to "tunnel-cloak-watchdog/1.0 (+cron)". Uncomment to
     // customise:
