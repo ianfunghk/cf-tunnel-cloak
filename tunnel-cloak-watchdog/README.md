@@ -102,6 +102,7 @@ Only the non-personal tunables live in the committed config. Open
 | `TARGET_SCRIPT` | Name of the fallback Worker script. | `tunnel-cloak-fallback` |
 | `PROBE_TIMEOUT_MS` | Probe timeout in ms. | `8000` |
 | `FAILURE_THRESHOLD` | Consecutive failures before flipping to DOWN. | `2` |
+| `PROBE_USER_AGENT` | User-Agent header sent on probe. Override if your origin blocks unknown UAs. | `tunnel-cloak-watchdog/1.0 (+cron)` |
 
 > **Why not put personal values here?** Anything in `wrangler.jsonc` → `vars`
 > is committed to the repo in plaintext. To keep your domain and zone ID out
@@ -190,26 +191,19 @@ curl "http://localhost:8787/cdn-cgi/handler/scheduled?cron=*+*+*+*+*"
 
 ## Checking the current state
 
-The Worker also exposes a small HTTP status page at its `workers.dev` URL
-(or wherever you route it). GET it for a JSON snapshot:
+This Worker has no HTTP handler — it only runs on the cron trigger. To
+inspect the persisted state:
 
-```jsonc
-{
-  "monitor_url": "https://app.example.com/health",
-  "managed_route": { "pattern": "fallback.example.com/*", "script": "tunnel-cloak-fallback" },
-  "state": {
-    "status": "up",
-    "consecutiveFailures": 0,
-    "routeId": null,
-    "updatedAt": "2026-07-27T03:42:11.000Z"
-  }
-}
+```bash
+# Latest state JSON straight from KV.
+npx wrangler kv key get --binding=STATUS_KV "monitor:state"
+
+# Or live-tail the structured per-tick logs:
+npx wrangler tail
 ```
 
-> **Heads-up for public repos**: this endpoint echoes `MONITOR_URL` and
-> `TARGET_PATTERN`. If those values are sensitive, protect the endpoint with
-> [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/self-hosted-public-app/)
-> or remove the `fetch` handler from `worker.js`.
+Each tick emits one JSON log line with `message: "tick complete"` plus the
+current `status`, `consecutive_failures`, `route_id`, and `updated_at`.
 
 ## Logs
 

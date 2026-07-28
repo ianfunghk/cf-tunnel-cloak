@@ -20,7 +20,10 @@
   "kv_namespaces": [
     {
       "binding": "STATUS_KV",
-      "id": "e8f8b6b3c0414340b7781fc07d577485"
+      // Placeholder — replace with the id returned by:
+      //   npx wrangler kv namespace create STATUS_KV
+      // (See README → "Deployment steps" → step 1.)
+      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
     }
   ],
   // Non-secret, non-personal config lives here as plain vars.
@@ -44,6 +47,10 @@
     "PROBE_TIMEOUT_MS": "8000",
     // Consecutive probe failures before flipping to DOWN (anti-flap).
     "FAILURE_THRESHOLD": "2"
+    // Override the probe User-Agent by setting PROBE_USER_AGENT here or as a
+    // secret. Defaults to "tunnel-cloak-watchdog/1.0 (+cron)". Uncomment to
+    // customise:
+    // , "PROBE_USER_AGENT": "Mozilla/5.0 (compatible; MyProbe/1.0)"
   },
   "observability": {
     "enabled": true,

@@ -29,8 +29,9 @@ const DEFAULT_TIMEOUT_MS = 8000;
 const DEFAULT_FAILURE_THRESHOLD = 2;
 /** Minimum probe timeout — anything below this is almost certainly a misconfig. */
 const MIN_TIMEOUT_MS = 500;
-/** User-Agent used for the probe. */
-const PROBE_USER_AGENT = 'tunnel-cloak-watchdog/1.0 (+cron)';
+/** Default User-Agent for the probe. Override via env.PROBE_USER_AGENT
+ *  (some origins reject unknown UAs). */
+const DEFAULT_PROBE_USER_AGENT = 'tunnel-cloak-watchdog/1.0 (+cron)';
 
 /**
  * Parse a positive-integer env var. Empty / unset / NaN → fallback. `0` is
@@ -97,9 +98,10 @@ function validateConfig(env) {
  *
  * @param {string} url
  * @param {number} timeoutMs
+ * @param {string} userAgent
  * @returns {Promise<boolean>}
  */
-async function isSiteUp(url, timeoutMs) {
+async function isSiteUp(url, timeoutMs, userAgent) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -107,7 +109,7 @@ async function isSiteUp(url, timeoutMs) {
     const response = await fetch(url, {
       method: 'GET',
       redirect: 'follow',
-      headers: { 'User-Agent': PROBE_USER_AGENT },
+      headers: { 'User-Agent': userAgent },
       signal: controller.signal,
       // Don't read the body — we only care about the status code, and the
       // body may be large. cf/workers best practice: never await .text()
@@ -376,8 +378,11 @@ async function runTick(env) {
 
   const timeoutMs = timeoutMsEnv(env.PROBE_TIMEOUT_MS);
   const threshold = positiveIntEnv(env.FAILURE_THRESHOLD, DEFAULT_FAILURE_THRESHOLD);
+  const userAgent = env.PROBE_USER_AGENT && env.PROBE_USER_AGENT.trim()
+    ? env.PROBE_USER_AGENT
+    : DEFAULT_PROBE_USER_AGENT;
 
-  const up = await isSiteUp(env.MONITOR_URL, timeoutMs);
+  const up = await isSiteUp(env.MONITOR_URL, timeoutMs, userAgent);
 
   const state = await readState(env.STATUS_KV);
   const now = new Date().toISOString();
@@ -462,25 +467,5 @@ export default {
         stack: err instanceof Error ? err.stack : undefined,
       }));
     }
-  },
-
-  /**
-   * Optional HTTP handler — handy for a quick human-readable status page.
-   * Protect this with Cloudflare Access if you don't want it public.
-   */
-  async fetch(_request, env) {
-    const state = await readState(env.STATUS_KV);
-    const body = JSON.stringify(
-      {
-        monitor_url: env.MONITOR_URL,
-        managed_route: { pattern: env.TARGET_PATTERN, script: env.TARGET_SCRIPT },
-        state,
-      },
-      null,
-      2,
-    );
-    return new Response(body + '\n', {
-      headers: { 'Content-Type': 'application/json; charset=utf-8' },
-    });
   },
 };
