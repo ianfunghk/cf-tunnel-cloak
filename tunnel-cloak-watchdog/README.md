@@ -67,7 +67,11 @@ Add the following to your configuration file in your kv_namespaces array:
 }
 ```
 
-Copy the `id` value into `wrangler.jsonc` → `kv_namespaces[0].id`.
+Copy the `id` value — you'll need it in the next step.
+
+> **Don't paste it into `wrangler.jsonc`** — that file is committed with a
+> placeholder so the repo stays shareable. Instead, drop it in a local
+> override file (step 6).
 
 ### 2. Find your Zone ID
 
@@ -147,9 +151,27 @@ repo.
 > development (see [Local development](#local-development) below). That file
 > is gitignored.
 
-### 6. (Optional) Set the cron frequency
+### 6. Create the local override file
 
-In `wrangler.jsonc` → `triggers.crons`. Default is every minute:
+The committed `wrangler.jsonc` keeps a placeholder KV namespace id so the
+repo can be public. Put your real id in a gitignored override file and
+deploy from there:
+
+```bash
+cp wrangler.local.jsonc.example wrangler.local.jsonc
+# Edit wrangler.local.jsonc → replace REPLACE_WITH_YOUR_KV_NAMESPACE_ID
+# with the id from step 1.
+```
+
+`wrangler.local.jsonc` is a full Wrangler config (not a patch), so it
+overrides anything in `wrangler.jsonc`. You can also use it to customise
+cron, vars, or observability per machine without touching the committed
+file.
+
+### 7. (Optional) Set the cron frequency
+
+In `wrangler.jsonc` → `triggers.crons` (or in your local override).
+Default is every minute:
 
 ```jsonc
 "triggers": { "crons": ["* * * * *"] }
@@ -164,11 +186,15 @@ Plan limits ([docs](https://developers.cloudflare.com/workers/platform/limits/))
 
 > Cron changes can take up to 15 minutes to propagate.
 
-### 7. Deploy
+### 8. Deploy
 
 ```bash
-npx wrangler deploy
+npx wrangler deploy -c wrangler.local.jsonc
 ```
+
+> If you see `KV namespace 'REPLACE_WITH_YOUR_KV_NAMESPACE_ID' is not valid
+> [code: 10042]`, you forgot the `-c wrangler.local.jsonc` flag and Wrangler
+> picked up the placeholder from the committed config.
 
 ## Local development
 

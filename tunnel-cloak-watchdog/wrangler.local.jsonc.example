@@ -1,0 +1,38 @@
+{
+  // Local override file for `wrangler deploy`.
+  //
+  // The committed `wrangler.jsonc` has a placeholder KV namespace id so the
+  // repo can be public without binding to a specific account. Copy this
+  // file to `wrangler.local.jsonc` (gitignored) and put your real namespace
+  // id there:
+  //
+  //   cp wrangler.local.jsonc.example wrangler.local.jsonc
+  //   # edit the id below
+  //   npx wrangler deploy -c wrangler.local.jsonc
+  //
+  // Why a separate file? Wrangler 4 does NOT support multiple --config flags
+  // for `deploy`, and there is no env-var override for kv_namespaces[].id.
+  // The override file IS the cleanest way to keep the repo public and still
+  // deploy without hand-editing wrangler.jsonc every time.
+  //
+  // Any field you omit here falls back to wrangler.jsonc — so you can also
+  // use this file to override crons, vars, observability, etc. per machine.
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "tunnel-cloak-watchdog",
+  "main": "worker.js",
+  "compatibility_date": "2026-07-27",
+  "compatibility_flags": ["nodejs_compat"],
+  "triggers": { "crons": ["* * * * *"] },
+  "kv_namespaces": [
+    {
+      "binding": "STATUS_KV",
+      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+    }
+  ],
+  "vars": {
+    "TARGET_SCRIPT": "tunnel-cloak-fallback",
+    "PROBE_TIMEOUT_MS": "8000",
+    "FAILURE_THRESHOLD": "2"
+  },
+  "observability": { "enabled": true, "logs": { "head_sampling_rate": 1 } }
+}
