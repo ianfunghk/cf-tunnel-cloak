@@ -27,8 +27,37 @@
 const DEFAULT_TIMEOUT_MS = 8000;
 /** Consecutive failures required before flipping to DOWN (anti-flap). */
 const DEFAULT_FAILURE_THRESHOLD = 2;
+/** Minimum probe timeout — anything below this is almost certainly a misconfig. */
+const MIN_TIMEOUT_MS = 500;
 /** User-Agent used for the probe. */
 const PROBE_USER_AGENT = 'tunnel-cloak-watchdog/1.0 (+cron)';
+
+/**
+ * Parse a positive-integer env var. Empty / unset / NaN → fallback. `0` is
+ * NOT ignored (unlike `Number(x) || default`), but values < 1 fall back too,
+ * so setting FAILURE_THRESHOLD=0 still does the safe thing.
+ *
+ * @param {string|undefined} raw
+ * @param {number} fallback
+ * @returns {number}
+ */
+function positiveIntEnv(raw, fallback) {
+  if (raw == null || raw === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) return fallback;
+  return n;
+}
+
+/**
+ * Parse the probe timeout. Lower-bounded by MIN_TIMEOUT_MS so a typo like
+ * "50" doesn't make every probe time out instantly.
+ */
+function timeoutMsEnv(raw) {
+  if (raw == null || raw === '') return DEFAULT_TIMEOUT_MS;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_TIMEOUT_MS;
+  return Math.max(MIN_TIMEOUT_MS, Math.floor(n));
+}
 
 // ---------------------------------------------------------------------------
 // Config validation — fail fast on missing/malformed secrets so we never
@@ -36,10 +65,10 @@ const PROBE_USER_AGENT = 'tunnel-cloak-watchdog/1.0 (+cron)';
 // API errors. Returns { ok: true } or { ok: false, error }.
 // ---------------------------------------------------------------------------
 function validateConfig(env) {
-  const required = ['MONITOR_URL', 'TARGET_ZONE_ID', 'TARGET_PATTERN', 'CF_API_TOKEN'];
+  const required = ['MONITOR_URL', 'TARGET_ZONE_ID', 'TARGET_PATTERN', 'TARGET_SCRIPT', 'CF_API_TOKEN'];
   const missing = required.filter((k) => !env[k] || typeof env[k] !== 'string' || env[k].trim() === '');
   if (missing.length) {
-    return { ok: false, error: `missing required secrets: ${missing.join(', ')}` };
+    return { ok: false, error: `missing required secrets/vars: ${missing.join(', ')}` };
   }
   if (!/^https?:\/\//i.test(env.MONITOR_URL)) {
     return { ok: false, error: `MONITOR_URL must be an http(s) URL, got: ${env.MONITOR_URL}` };
@@ -65,17 +94,14 @@ function validateConfig(env) {
  * DOWN = 5xx response, network error, or timeout.
  *
  * (4xx is treated as UP because a 404/401 still proves the origin is alive.)
+ *
+ * @param {string} url
+ * @param {number} timeoutMs
+ * @returns {Promise<boolean>}
  */
-async function isSiteUp(url, timeoutMs, signal) {
+async function isSiteUp(url, timeoutMs) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-  // Combine the caller's signal (e.g. cron cancellation) with our timeout.
-  const onAbort = () => controller.abort();
-  if (signal) {
-    if (signal.aborted) controller.abort();
-    else signal.addEventListener('abort', onAbort, { once: true });
-  }
 
   try {
     const response = await fetch(url, {
@@ -87,6 +113,10 @@ async function isSiteUp(url, timeoutMs, signal) {
       // body may be large. cf/workers best practice: never await .text()
       // on unbounded payloads.
     });
+    // Explicitly drop the body so the underlying connection is released
+    // promptly instead of lingering until GC. Cheap and avoids holding
+    // sockets on a busy cron.
+    response.body?.cancel();
     return response.status < 500;
   } catch (error) {
     // AbortError (timeout) or a network-level failure → site is down.
@@ -98,7 +128,6 @@ async function isSiteUp(url, timeoutMs, signal) {
     return false;
   } finally {
     clearTimeout(timeoutId);
-    if (signal) signal.removeEventListener('abort', onAbort);
   }
 }
 
@@ -172,9 +201,17 @@ function createRoute(token, zoneId, pattern, script) {
   return cfApiFetch(token, 'POST', `/zones/${zoneId}/workers/routes`, { pattern, script });
 }
 
-/** List all routes for a zone. Returns [{id, pattern, script}, ...]. */
+/**
+ * List routes for a zone. We request the max page size (per_page=50) so a
+ * zone with many routes still returns ours on the first page — Cloudflare's
+ * default page is 20, which is easy to exceed.
+ *
+ * Caveat: this still only fetches one page. The fallback Worker pattern is
+ * unique enough that pagination isn't worth the complexity here, but if you
+ * have 50+ worker routes on the same zone, switch to a paginating loop.
+ */
 function listRoutes(token, zoneId) {
-  return cfApiFetch(token, 'GET', `/zones/${zoneId}/workers/routes`);
+  return cfApiFetch(token, 'GET', `/zones/${zoneId}/workers/routes?per_page=50`);
 }
 
 /** Delete a route by id. Idempotent: a 404 / "route not found" is treated
@@ -337,8 +374,8 @@ async function runTick(env) {
     return;
   }
 
-  const timeoutMs = Number(env.PROBE_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
-  const threshold = Number(env.FAILURE_THRESHOLD) || DEFAULT_FAILURE_THRESHOLD;
+  const timeoutMs = timeoutMsEnv(env.PROBE_TIMEOUT_MS);
+  const threshold = positiveIntEnv(env.FAILURE_THRESHOLD, DEFAULT_FAILURE_THRESHOLD);
 
   const up = await isSiteUp(env.MONITOR_URL, timeoutMs);
 
