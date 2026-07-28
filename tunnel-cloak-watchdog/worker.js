@@ -177,9 +177,29 @@ function listRoutes(token, zoneId) {
   return cfApiFetch(token, 'GET', `/zones/${zoneId}/workers/routes`);
 }
 
-/** Delete a route by id. */
-function deleteRoute(token, zoneId, routeId) {
-  return cfApiFetch(token, 'DELETE', `/zones/${zoneId}/workers/routes/${routeId}`);
+/** Delete a route by id. Idempotent: a 404 / "route not found" is treated
+ *  as success because the target state (route absent) is already achieved.
+ *  This prevents a stuck-down state when the route was removed out of band
+ *  (e.g. via the dashboard) while KV still references its id. */
+async function deleteRoute(token, zoneId, routeId) {
+  try {
+    return await cfApiFetch(token, 'DELETE', `/zones/${zoneId}/workers/routes/${routeId}`);
+  } catch (err) {
+    if (isRouteNotFoundError(err)) return null;
+    throw err;
+  }
+}
+
+/**
+ * Heuristic for "the route referenced by id does not exist anymore".
+ * Cloudflare signals this via HTTP 404 or API error code 7003
+ * ("could not find route"). We match liberally to stay robust against
+ * minor wording changes in the API error text.
+ */
+function isRouteNotFoundError(err) {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message;
+  return /HTTP 404|\b7003\b|could not find route|route not found/i.test(msg);
 }
 
 /**
@@ -203,21 +223,60 @@ async function findManagedRouteId(token, zoneId, pattern, script) {
  * Enable the fallback Worker by adding its route.
  * Stores the resulting route id in state so we can delete it later without
  * another list call.
+ *
+ * Self-healing: if the route already exists (e.g. a previous createRoute
+ * succeeded but the KV write that recorded the id failed), we fall back to
+ * a list lookup instead of throwing. Without this, the watchdog would get
+ * stuck in 'up' state and fail every tick trying to recreate the route.
  */
 async function enableFallback(env, state) {
-  const route = await createRoute(
-    env.CF_API_TOKEN,
-    env.TARGET_ZONE_ID,
-    env.TARGET_PATTERN,
-    env.TARGET_SCRIPT,
-  );
-  console.log(JSON.stringify({
-    message: 'route added — fallback worker enabled',
-    pattern: env.TARGET_PATTERN,
-    script: env.TARGET_SCRIPT,
-    route_id: route?.id,
-  }));
-  return { ...state, status: 'down', routeId: route?.id ?? null };
+  try {
+    const route = await createRoute(
+      env.CF_API_TOKEN,
+      env.TARGET_ZONE_ID,
+      env.TARGET_PATTERN,
+      env.TARGET_SCRIPT,
+    );
+    console.log(JSON.stringify({
+      message: 'route added — fallback worker enabled',
+      pattern: env.TARGET_PATTERN,
+      script: env.TARGET_SCRIPT,
+      route_id: route?.id,
+    }));
+    return { ...state, status: 'down', routeId: route?.id ?? null };
+  } catch (err) {
+    if (!isRouteAlreadyExistsError(err)) throw err;
+    const existingId = await findManagedRouteId(
+      env.CF_API_TOKEN,
+      env.TARGET_ZONE_ID,
+      env.TARGET_PATTERN,
+      env.TARGET_SCRIPT,
+    );
+    if (!existingId) {
+      // Pathological: API said "already exists" but we can't find it via
+      // list. Re-throw so the tick fails loudly rather than silently
+      // drifting into a wrong state.
+      throw err;
+    }
+    console.warn(JSON.stringify({
+      message: 'route already exists — adopted existing route id',
+      pattern: env.TARGET_PATTERN,
+      script: env.TARGET_SCRIPT,
+      route_id: existingId,
+    }));
+    return { ...state, status: 'down', routeId: existingId };
+  }
+}
+
+/**
+ * Heuristic for "the route pattern is already taken". Cloudflare returns
+ * HTTP 4xx with error code 10073 or text "X already exists" on duplicate
+ * pattern. Match liberally to stay resilient to wording changes.
+ */
+function isRouteAlreadyExistsError(err) {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message;
+  return /already exists|\b10073\b|duplicate/i.test(msg);
 }
 
 /**
@@ -259,6 +318,91 @@ async function disableFallback(env, state) {
 // Handler
 // ---------------------------------------------------------------------------
 
+/**
+ * Single cron tick. Pulled out of the `scheduled` entry point so the
+ * handler can wrap every code path in a structured try/catch without
+ * drowning the state-machine logic in indentation.
+ *
+ * @param {Record<string, any>} env
+ */
+async function runTick(env) {
+  // Fail fast on missing/malformed config so we never send a request to
+  // /zones/<undefined>/workers/routes and produce a confusing 7003 error.
+  const cfg = validateConfig(env);
+  if (!cfg.ok) {
+    console.error(JSON.stringify({
+      message: 'config invalid, aborting tick',
+      error: cfg.error,
+    }));
+    return;
+  }
+
+  const timeoutMs = Number(env.PROBE_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
+  const threshold = Number(env.FAILURE_THRESHOLD) || DEFAULT_FAILURE_THRESHOLD;
+
+  const up = await isSiteUp(env.MONITOR_URL, timeoutMs);
+
+  const state = await readState(env.STATUS_KV);
+  const now = new Date().toISOString();
+  let nextState = state;
+
+  if (up) {
+    if (state.status === 'down') {
+      // Recovered — remove the route to disable the fallback Worker.
+      nextState = {
+        ...(await disableFallback(env, state)),
+        consecutiveFailures: 0,
+        updatedAt: now,
+      };
+    } else if (state.consecutiveFailures !== 0) {
+      // Was tentatively failing but is back up before crossing threshold.
+      // Reset the counter (status & routeId unchanged). If the counter was
+      // already 0, there is nothing material to write — leave nextState ===
+      // state so we skip the KV write entirely.
+      nextState = { ...state, consecutiveFailures: 0, updatedAt: now };
+    }
+    // else: still up, counter already 0 → no material change, skip write.
+  } else {
+    const failures = state.consecutiveFailures + 1;
+    if (state.status === 'up' && failures >= threshold) {
+      // Just went down — add the route to enable the fallback Worker.
+      nextState = {
+        ...(await enableFallback(env, state)),
+        consecutiveFailures: failures,
+        updatedAt: now,
+      };
+    } else if (state.status === 'up') {
+      // Still below threshold — record the accumulating failure so future
+      // ticks can eventually trip the threshold.
+      nextState = { ...state, consecutiveFailures: failures, updatedAt: now };
+      console.log(JSON.stringify({
+        message: 'probe failed',
+        consecutive_failures: failures,
+        threshold,
+        current_status: state.status,
+      }));
+    }
+    // else: already DOWN and the route is already wired in. The
+    // consecutiveFailures counter has no further effect while DOWN (no
+    // logic reads it once status === 'down'), so we deliberately do NOT
+    // bump it — that would be a KV write on every tick for nothing.
+    // nextState stays === state.
+  }
+
+  if (hasStateChanged(state, nextState)) {
+    await writeState(env.STATUS_KV, nextState);
+  }
+  console.log(JSON.stringify({
+    message: 'tick complete',
+    probe_up: up,
+    status: nextState.status,
+    consecutive_failures: nextState.consecutiveFailures,
+    route_id: nextState.routeId,
+    updated_at: nextState.updatedAt,
+    kv_written: hasStateChanged(state, nextState),
+  }));
+}
+
 export default {
   /**
    * Cron entry point.
@@ -268,81 +412,19 @@ export default {
    * @param {ExecutionContext} _ctx
    */
   async scheduled(_controller, env, _ctx) {
-    // Fail fast on missing/malformed config so we never send a request to
-    // /zones/<undefined>/workers/routes and produce a confusing 7003 error.
-    const cfg = validateConfig(env);
-    if (!cfg.ok) {
+    try {
+      await runTick(env);
+    } catch (err) {
+      // Never let an exception escape unhandled — Worker runtime logs it
+      // as an unstructured crash, losing the tick context. Emit our own
+      // structured error so `wrangler tail` stays readable and the
+      // observability dashboard keeps a clean signal.
       console.error(JSON.stringify({
-        message: 'config invalid, aborting tick',
-        error: cfg.error,
+        message: 'tick crashed',
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
       }));
-      return;
     }
-
-    const timeoutMs = Number(env.PROBE_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS;
-    const threshold = Number(env.FAILURE_THRESHOLD) || DEFAULT_FAILURE_THRESHOLD;
-
-    const up = await isSiteUp(env.MONITOR_URL, timeoutMs);
-
-    const state = await readState(env.STATUS_KV);
-    const now = new Date().toISOString();
-    let nextState = state;
-
-    if (up) {
-      if (state.status === 'down') {
-        // Recovered — remove the route to disable the fallback Worker.
-        nextState = {
-          ...(await disableFallback(env, state)),
-          consecutiveFailures: 0,
-          updatedAt: now,
-        };
-      } else if (state.consecutiveFailures !== 0) {
-        // Was tentatively failing but is back up before crossing threshold.
-        // Reset the counter (status & routeId unchanged). If the counter was
-        // already 0, there is nothing material to write — leave nextState ===
-        // state so we skip the KV write entirely.
-        nextState = { ...state, consecutiveFailures: 0, updatedAt: now };
-      }
-      // else: still up, counter already 0 → no material change, skip write.
-    } else {
-      const failures = state.consecutiveFailures + 1;
-      if (state.status === 'up' && failures >= threshold) {
-        // Just went down — add the route to enable the fallback Worker.
-        nextState = {
-          ...(await enableFallback(env, state)),
-          consecutiveFailures: failures,
-          updatedAt: now,
-        };
-      } else if (state.status === 'up') {
-        // Still below threshold — record the accumulating failure so future
-        // ticks can eventually trip the threshold.
-        nextState = { ...state, consecutiveFailures: failures, updatedAt: now };
-        console.log(JSON.stringify({
-          message: 'probe failed',
-          consecutive_failures: failures,
-          threshold,
-          current_status: state.status,
-        }));
-      }
-      // else: already DOWN and the route is already wired in. The
-      // consecutiveFailures counter has no further effect while DOWN (no
-      // logic reads it once status === 'down'), so we deliberately do NOT
-      // bump it — that would be a KV write on every tick for nothing.
-      // nextState stays === state.
-    }
-
-    if (hasStateChanged(state, nextState)) {
-      await writeState(env.STATUS_KV, nextState);
-    }
-    console.log(JSON.stringify({
-      message: 'tick complete',
-      probe_up: up,
-      status: nextState.status,
-      consecutive_failures: nextState.consecutiveFailures,
-      route_id: nextState.routeId,
-      updated_at: nextState.updatedAt,
-      kv_written: hasStateChanged(state, nextState),
-    }));
   },
 
   /**
