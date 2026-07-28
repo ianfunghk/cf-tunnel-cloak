@@ -8,6 +8,12 @@
  * State is persisted in KV so we only call the Cloudflare API on actual
  * state transitions (down → up, up → down), not on every cron tick.
  *
+ * KV write minimization: we only write back when a *material* field
+ * (status, consecutiveFailures, routeId) actually changes. A steady-state
+ * tick (origin still up, still healthy) does not touch KV at all, which
+ * keeps us well within the Free plan's 1,000 writes/day quota even with a
+ * 1-minute cron (1,440 ticks/day).
+ *
  * All runtime configuration comes from environment variables / secrets
  * (see wrangler.jsonc bindings and `.dev.vars.example`). No secrets in
  * source.
@@ -118,6 +124,20 @@ async function readState(kv) {
 /** Write the state back to KV. */
 async function writeState(kv, state) {
   await kv.put('monitor:state', JSON.stringify(state));
+}
+
+/**
+ * Compare two states by the fields that actually affect behaviour.
+ * `updatedAt` is intentionally ignored — it's a human-readable timestamp
+ * with no downstream effect, so changing only that is not worth a KV write.
+ */
+function hasStateChanged(prev, next) {
+  if (prev === next) return false;
+  return (
+    prev.status !== next.status ||
+    prev.consecutiveFailures !== next.consecutiveFailures ||
+    prev.routeId !== next.routeId
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -276,10 +296,14 @@ export default {
           consecutiveFailures: 0,
           updatedAt: now,
         };
-      } else {
-        // Still up — just reset the failure counter.
+      } else if (state.consecutiveFailures !== 0) {
+        // Was tentatively failing but is back up before crossing threshold.
+        // Reset the counter (status & routeId unchanged). If the counter was
+        // already 0, there is nothing material to write — leave nextState ===
+        // state so we skip the KV write entirely.
         nextState = { ...state, consecutiveFailures: 0, updatedAt: now };
       }
+      // else: still up, counter already 0 → no material change, skip write.
     } else {
       const failures = state.consecutiveFailures + 1;
       if (state.status === 'up' && failures >= threshold) {
@@ -289,8 +313,9 @@ export default {
           consecutiveFailures: failures,
           updatedAt: now,
         };
-      } else {
-        // Still below threshold, or already down — just record the failure.
+      } else if (state.status === 'up') {
+        // Still below threshold — record the accumulating failure so future
+        // ticks can eventually trip the threshold.
         nextState = { ...state, consecutiveFailures: failures, updatedAt: now };
         console.log(JSON.stringify({
           message: 'probe failed',
@@ -299,9 +324,16 @@ export default {
           current_status: state.status,
         }));
       }
+      // else: already DOWN and the route is already wired in. The
+      // consecutiveFailures counter has no further effect while DOWN (no
+      // logic reads it once status === 'down'), so we deliberately do NOT
+      // bump it — that would be a KV write on every tick for nothing.
+      // nextState stays === state.
     }
 
-    await writeState(env.STATUS_KV, nextState);
+    if (hasStateChanged(state, nextState)) {
+      await writeState(env.STATUS_KV, nextState);
+    }
     console.log(JSON.stringify({
       message: 'tick complete',
       probe_up: up,
@@ -309,6 +341,7 @@ export default {
       consecutive_failures: nextState.consecutiveFailures,
       route_id: nextState.routeId,
       updated_at: nextState.updatedAt,
+      kv_written: hasStateChanged(state, nextState),
     }));
   },
 
